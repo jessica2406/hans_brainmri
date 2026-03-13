@@ -1,0 +1,21 @@
+# Environments
+hans_env/
+venv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data (Don't upload the thousands of processed images)
+data/processed/
+data/raw/
+
+# Large Model Weights
+# (If your .pth file is >50MB, it might be slow. We can upload it for now, 
+# but usually, we ignore it and share it via Google Drive)
+# brain_model_neural.pth
+
+# OS files
+.DS_Store
+Thumbs.db
