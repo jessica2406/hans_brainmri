@@ -6,7 +6,7 @@ from model import get_model
 
 # Config
 PROCESSED_DIR = "data/processed"
-EPOCHS = 50 # Start small to make sure it works
+EPOCHS = 50 
 BATCH_SIZE = 16
 LEARNING_RATE = 0.001
 
