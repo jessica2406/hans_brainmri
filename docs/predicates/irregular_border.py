@@ -1,20 +1,20 @@
 """
-irregular_border.py
+irregular_border.py (v2 - fixed, consistent with well_defined_border/central_location fixes)
 
 Independent (non-ResNet) predicate extractor for HAN-S.
 
-Estimates whether a lesion in a brain MRI slice has an irregular,
-infiltrative border using classical shape analysis (circularity,
-solidity, convex hull), as proposed in
-docs/Independent_AIL_Predicates.md.
+Fix vs v1:
+  1. Used a fixed intensity threshold (160), which failed to find any
+     contour at all on some real images (returned None/None). Switched
+     to Otsu's method so the threshold adapts per-image.
+  2. Did not exclude the skull/whole-brain contour, so on images where
+     the skull was the largest contour, circularity/solidity were
+     being computed on the wrong shape entirely. Added the same
+     skull-exclusion heuristic used in well_defined_border.py and
+     central_location.py for consistency across all predicates.
 
 Usage:
     python irregular_border.py path/to/mri.png
-
-Output:
-    Prints irregular_border = True/False
-    Saves a debug image "<input>_irregular_debug.png" showing the
-    lesion contour and its convex hull.
 """
 
 import sys
@@ -23,58 +23,69 @@ import cv2
 import numpy as np
 
 
+def _is_probably_skull(cnt, img_shape, area_fraction_limit=0.35, border_margin=5):
+    h, w = img_shape
+    img_area = h * w
+    area = cv2.contourArea(cnt)
+    if area > area_fraction_limit * img_area:
+        return True
+
+    x, y, cw, ch = cv2.boundingRect(cnt)
+    touches_border = (
+        x <= border_margin
+        or y <= border_margin
+        or (x + cw) >= (w - border_margin)
+        or (y + ch) >= (h - border_margin)
+    )
+    return touches_border
+
+
 def extract_irregular_border(
     image_path,
-    threshold_value=160,
     circularity_threshold=0.65,
     solidity_threshold=0.85,
+    min_area_fraction=0.005,
     debug=True,
 ):
     """
     Returns (predicate: bool, details: dict)
 
     Method:
-      1. Threshold + contour detection to isolate the candidate lesion
-         (largest contour above a minimum area).
-      2. Circularity = 4*pi*Area / Perimeter^2
-         - A perfect circle scores 1.0; irregular/infiltrative shapes
-           score noticeably lower.
-      3. Solidity = Area / ConvexHullArea
-         - A convex, well-bounded shape scores close to 1.0; a shape
-           with concavities/spiculations scores lower.
-      4. irregular_border = True if circularity is low AND solidity is
-         low (i.e. the shape is both non-circular and non-convex).
+      1. Otsu-thresholded binary mask (adapts per image, unlike a
+         fixed intensity cutoff).
+      2. Exclude skull/whole-brain contours.
+      3. Circularity = 4*pi*Area / Perimeter^2 (1.0 = perfect circle).
+      4. Solidity = Area / ConvexHullArea (1.0 = fully convex).
+      5. irregular_border = True if both circularity and solidity are
+         low (non-circular AND non-convex).
     """
     gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if gray is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
 
+    h, w = gray.shape
+    img_area = h * w
+
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    _, thresh = cv2.threshold(
-        blur, threshold_value, 255, cv2.THRESH_BINARY
-    )
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    contours, _ = cv2.findContours(
-        thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
+    candidates = [
+        c for c in contours
+        if cv2.contourArea(c) > min_area_fraction * img_area
+        and not _is_probably_skull(c, (h, w))
+    ]
 
-    img_area = gray.shape[0] * gray.shape[1]
-    min_area = 0.01 * img_area
-
-    valid_contours = [c for c in contours if cv2.contourArea(c) > min_area]
-
-    if not valid_contours:
-        predicate = False
-        details = {
-            "reason": "no contour of sufficient size found",
+    if not candidates:
+        return False, {
+            "reason": "no non-skull lesion candidate found",
             "circularity": None,
             "solidity": None,
             "debug_image": None,
         }
-        return predicate, details
 
-    lesion = max(valid_contours, key=cv2.contourArea)
+    lesion = max(candidates, key=cv2.contourArea)
 
     area = cv2.contourArea(lesion)
     perimeter = cv2.arcLength(lesion, True)
@@ -84,10 +95,7 @@ def extract_irregular_border(
     hull_area = cv2.contourArea(hull)
     solidity = area / hull_area if hull_area > 0 else 0
 
-    predicate = (
-        circularity < circularity_threshold
-        and solidity < solidity_threshold
-    )
+    predicate = circularity < circularity_threshold and solidity < solidity_threshold
 
     if debug:
         debug_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
@@ -104,8 +112,7 @@ def extract_irregular_border(
         "perimeter": round(perimeter, 2),
         "circularity": round(circularity, 3),
         "solidity": round(solidity, 3),
-        "circularity_threshold": circularity_threshold,
-        "solidity_threshold": solidity_threshold,
+        "num_candidates_considered": len(candidates),
         "debug_image": debug_path,
     }
 
