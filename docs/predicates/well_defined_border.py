@@ -1,15 +1,25 @@
 """
-well_defined_border.py (v2 - fixed per PR review)
+well_defined_border.py (v3 - recalibrated based on real test data)
 
 Independent (non-ResNet) predicate extractor for HAN-S.
 
-Fix vs v1: the original version measured edge strength around the
-LARGEST edge contour, which on a brain MRI is almost always the skull
-outline, not the lesion. That made the predicate return an almost
-constant value regardless of the true class. This version explicitly
-excludes skull-sized contours (anything covering a large fraction of
-the image, or touching the image border) before selecting a lesion
-candidate, so the measurement reflects the actual mass boundary.
+Fix vs v2: raw Canny edge strength around the lesion contour turned
+out to be a poor discriminator in practice - real testing across
+meningioma, no_tumor, pituitary, and glioma samples showed edge
+strength clustered tightly (48-63) regardless of class, giving a
+near-constant False.
+
+Solidity (Area / ConvexHullArea) showed much better separation on the
+same test data: meningioma ~0.93 (smooth, convex, well-defined) vs
+no_tumor/pituitary/glioma ~0.68-0.73 (more irregular/less convex).
+This matches the clinical rationale directly: a well-defined border
+is smooth and convex, which solidity measures more directly than
+average edge brightness does. This version uses solidity (plus a
+circularity sanity check) as the primary signal, calibrated against
+the midpoint between the observed clusters.
+
+NOTE: calibrated on a small sample (1 image per class). Thresholds
+should be revisited once more images per class are tested.
 
 Usage:
     python well_defined_border.py path/to/mri.png
@@ -22,8 +32,6 @@ import numpy as np
 
 
 def _is_probably_skull(cnt, img_shape, area_fraction_limit=0.35, border_margin=5):
-    """Heuristic: skull/whole-brain contours are large and touch the
-    image border; true lesions are smaller and interior."""
     h, w = img_shape
     img_area = h * w
     area = cv2.contourArea(cnt)
@@ -42,9 +50,7 @@ def _is_probably_skull(cnt, img_shape, area_fraction_limit=0.35, border_margin=5
 
 def extract_well_defined_border(
     image_path,
-    canny_low=50,
-    canny_high=150,
-    edge_strength_threshold=100.0,
+    solidity_threshold=0.85,
     min_area_fraction=0.005,
     debug=True,
 ):
@@ -52,15 +58,12 @@ def extract_well_defined_border(
     Returns (predicate: bool, details: dict)
 
     Method:
-      1. Canny edge detection on the grayscale MRI.
-      2. Find candidate lesion contours, EXCLUDING skull/whole-brain
-         contours (large and/or border-touching).
-      3. Measure edge strength (Canny) and continuity specifically
-         around the selected lesion candidate contour.
-      4. well_defined_border = True if edge strength and continuity
-         both exceed thresholds calibrated against real class-
-         separated data (see PR discussion) rather than a fixed
-         guess.
+      1. Otsu-thresholded binary mask.
+      2. Exclude skull/whole-brain contours.
+      3. Solidity = Area / ConvexHullArea. Smooth, well-bounded
+         lesions (e.g. meningioma) are highly convex (~0.9+);
+         irregular/infiltrative or diffuse lesions score lower.
+      4. well_defined_border = True if solidity exceeds threshold.
     """
     gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if gray is None:
@@ -69,12 +72,9 @@ def extract_well_defined_border(
     h, w = gray.shape
     img_area = h * w
 
-    blur = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(blur, canny_low, canny_high)
-
-    # Use intensity thresholding (not just raw edges) to find candidate
-    # lesion regions - more robust than relying on edge contours alone.
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
     candidates = [
@@ -84,29 +84,25 @@ def extract_well_defined_border(
     ]
 
     if not candidates:
-        predicate = False
-        details = {
+        return False, {
             "reason": "no non-skull lesion candidate found",
-            "region_edge_strength": None,
-            "continuity": None,
+            "solidity": None,
             "debug_image": None,
         }
-        return predicate, details
 
     lesion = max(candidates, key=cv2.contourArea)
 
-    mask = np.zeros_like(gray)
-    cv2.drawContours(mask, [lesion], -1, 255, thickness=3)
-    region_edge_strength = float(np.mean(edges[mask == 255])) if np.any(mask == 255) else 0.0
-    perimeter = cv2.arcLength(lesion, True)
-    continuity = float(np.count_nonzero(edges[mask == 255])) / max(perimeter, 1)
+    area = cv2.contourArea(lesion)
+    hull = cv2.convexHull(lesion)
+    hull_area = cv2.contourArea(hull)
+    solidity = area / hull_area if hull_area > 0 else 0
 
-    predicate = region_edge_strength > edge_strength_threshold and continuity > 0.5
+    predicate = solidity > solidity_threshold
 
     if debug:
         debug_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        debug_img[edges > 0] = (0, 0, 255)
         cv2.drawContours(debug_img, [lesion], -1, (0, 255, 0), 2)
+        cv2.drawContours(debug_img, [hull], -1, (255, 0, 0), 1)
         base, ext = os.path.splitext(image_path)
         debug_path = f"{base}_border_debug.png"
         cv2.imwrite(debug_path, debug_img)
@@ -114,9 +110,8 @@ def extract_well_defined_border(
         debug_path = None
 
     details = {
-        "region_edge_strength": round(region_edge_strength, 2),
-        "continuity": round(continuity, 3),
-        "threshold_used": edge_strength_threshold,
+        "solidity": round(solidity, 3),
+        "threshold_used": solidity_threshold,
         "num_candidates_considered": len(candidates),
         "debug_image": debug_path,
     }
@@ -133,7 +128,6 @@ if __name__ == "__main__":
     predicate, details = extract_well_defined_border(image_path)
 
     print(f"well_defined_border = {predicate}")
-    print(f"  region_edge_strength: {details.get('region_edge_strength')}")
-    print(f"  continuity: {details.get('continuity')}")
+    print(f"  solidity: {details.get('solidity')}")
     if details.get("debug_image"):
         print(f"  debug image saved: {details['debug_image']}")
