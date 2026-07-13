@@ -1,25 +1,13 @@
 """
-well_defined_border.py (v3 - recalibrated based on real test data)
+well_defined_border.py (v4 - uses shared, tightened segmentation)
 
 Independent (non-ResNet) predicate extractor for HAN-S.
 
-Fix vs v2: raw Canny edge strength around the lesion contour turned
-out to be a poor discriminator in practice - real testing across
-meningioma, no_tumor, pituitary, and glioma samples showed edge
-strength clustered tightly (48-63) regardless of class, giving a
-near-constant False.
-
-Solidity (Area / ConvexHullArea) showed much better separation on the
-same test data: meningioma ~0.93 (smooth, convex, well-defined) vs
-no_tumor/pituitary/glioma ~0.68-0.73 (more irregular/less convex).
-This matches the clinical rationale directly: a well-defined border
-is smooth and convex, which solidity measures more directly than
-average edge brightness does. This version uses solidity (plus a
-circularity sanity check) as the primary signal, calibrated against
-the midpoint between the observed clusters.
-
-NOTE: calibrated on a small sample (1 image per class). Thresholds
-should be revisited once more images per class are tested.
+See lesion_segmentation.py for the segmentation fix details (adds
+bounding-box coverage, extent, and aspect-ratio checks on top of the
+previous area/border-touch filter, after debug-image inspection showed
+a near-whole-brain-outline contour was slipping through the old
+filter on at least one image).
 
 Usage:
     python well_defined_border.py path/to/mri.png
@@ -30,22 +18,8 @@ import os
 import cv2
 import numpy as np
 
-
-def _is_probably_skull(cnt, img_shape, area_fraction_limit=0.35, border_margin=5):
-    h, w = img_shape
-    img_area = h * w
-    area = cv2.contourArea(cnt)
-    if area > area_fraction_limit * img_area:
-        return True
-
-    x, y, cw, ch = cv2.boundingRect(cnt)
-    touches_border = (
-        x <= border_margin
-        or y <= border_margin
-        or (x + cw) >= (w - border_margin)
-        or (y + ch) >= (h - border_margin)
-    )
-    return touches_border
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lesion_segmentation import get_lesion_candidates
 
 
 def extract_well_defined_border(
@@ -54,38 +28,19 @@ def extract_well_defined_border(
     min_area_fraction=0.005,
     debug=True,
 ):
-    """
-    Returns (predicate: bool, details: dict)
-
-    Method:
-      1. Otsu-thresholded binary mask.
-      2. Exclude skull/whole-brain contours.
-      3. Solidity = Area / ConvexHullArea. Smooth, well-bounded
-         lesions (e.g. meningioma) are highly convex (~0.9+);
-         irregular/infiltrative or diffuse lesions score lower.
-      4. well_defined_border = True if solidity exceeds threshold.
-    """
     gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if gray is None:
         raise FileNotFoundError(f"Could not read image: {image_path}")
 
-    h, w = gray.shape
-    img_area = h * w
-
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, thresh = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
     contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
 
-    candidates = [
-        c for c in contours
-        if cv2.contourArea(c) > min_area_fraction * img_area
-        and not _is_probably_skull(c, (h, w))
-    ]
+    candidates = get_lesion_candidates(gray, contours, min_area_fraction)
 
     if not candidates:
         return False, {
-            "reason": "no non-skull lesion candidate found",
+            "reason": "no lesion candidate found after segmentation filtering",
             "solidity": None,
             "debug_image": None,
         }
